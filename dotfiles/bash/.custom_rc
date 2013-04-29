@@ -1,0 +1,10 @@
+# source 'script/setup-env.bash' if it exists when cd'ing about
+function cd {
+    ENTER_SCRIPT='scripts/setup-env.bash'
+
+    if builtin cd "${@}"; then
+        if [ -f "${ENTER_SCRIPT}" ]; then
+            source "${ENTER_SCRIPT}"
+        fi
+    fi
+}
