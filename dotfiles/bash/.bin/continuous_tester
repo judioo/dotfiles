@@ -1,0 +1,299 @@
+#!/usr/bin/env perl
+
+package Test::Continuously;
+use strict;
+use warnings;
+use Pod::Usage;
+use Data::Dumper;
+use File::ChangeNotify;
+use Getopt::Long;
+
+my $test_to_class     = {};
+my $class_to_test     = {};
+my $flagged_for_debug = {};
+my $flagged_injection = {};
+my $last_run          = {};
+
+sub run {
+  my $class   = shift;
+  my $config  = $class->_get_config();
+
+  my $watcher = File::ChangeNotify->instantiate_watcher (
+    directories => $config->{dirs},
+    filter      => $config->{filter},
+  );
+
+
+
+  print STDERR "Started ". ( join ' , ', @{$config->{dirs}} ) . " watch\n";
+  while ( my @events = $watcher->wait_for_events() ) {
+    # on some OS's an update to an existing file is translated by
+    # File::ChangeNotify::Event as 2 events ( a type => 'create' the 'modify' )
+    # we want to catch as a single event so we do this...
+# not so on home VM
+#    @events = $class->_catch_all_events( watcher => $watcher, events => \@events );
+
+    print STDERR "change is afoot!\n\n";
+    my $changed  = {};
+    map{ $changed->{$_->path} = $_ } @events;
+
+    my $tests_to_run  = $class->resolve_events_to_tests( changed => $changed );
+    my $perl          = $class->get_perl( changed => $changed );
+
+    if( defined $config->{always_run} ) {
+      print STDERR "always run is set to always run " . $config->{always_run}. "\n";
+      $changed->{ $config->{always_run} } = 1;
+      $tests_to_run->{ $config->{always_run} } = 1;
+    }
+    
+    if( defined $config->{run_everything} && $config->{run_everything} ) {
+      print STDERR "running everything SET so running all changes as test files\n";
+
+      for my $test ( keys %$changed ) {
+        print STDERR "$perl -It/lib/ $test\n";
+        system "$perl -It/lib/ $test\n";
+      }
+    }
+    else {
+      unless( keys %$tests_to_run ) {
+        print STDERR "could not work out what to test for modified files ". 
+        ( join ' , ', keys %$changed ) ."\n";
+        next;
+      }
+
+      for my $test ( keys %$tests_to_run ) {
+        print STDERR "$perl -It/lib/ $test\n";
+        system "$perl -It/lib/ $test\n";
+      }
+
+      $last_run  = {};
+      map{ $last_run->{$_} = 1 } keys %$tests_to_run;
+    }
+
+
+  #  for my $event (@events) {
+  #    
+  #    print "Test ". $event->path . " changed:\nRunning tests\n";
+  #    system "$perl -It/lib/ ". $event->path;
+  #    print "\n\nDone\n\n";
+  #  }
+  }
+}
+
+sub _catch_all_events {
+  my $class   = shift;
+  my(%args)   = @_;
+  my($watcher, $events)
+    = @args{qw/watcher events/};
+
+  my @more_events =  $watcher->wait_for_events();
+  return @$events unless scalar @more_events;
+  return ( @$events, @more_events );
+}
+
+sub resolve_events_to_tests {
+  my( $class, %args )  = @_;
+  my( $changed )       = @args{qw/ changed /};
+  return {} unless( ref $changed eq 'HASH' &&  keys %$changed );
+#warn Dumper $changed; 
+  my $mapper;
+  # seperate test from code
+  for my $file ( keys %$changed ) {
+    my $type  = ( $file =~ m!t/! ) ? 'test' : 'code';
+    $mapper->{$type}->{$file} = 1;
+  }
+#warn Dumper $mapper;
+
+  my $to_run;
+
+  # map to global mappings
+  $to_run = $class->_map_tests_to_classes(
+    tests   => $mapper->{'test'},
+    classes => $mapper->{'code'}
+  );
+#warn "c-t : " . Dumper $class_to_test;
+#warn "t-c : " . Dumper $test_to_class;
+#warn "l-r : " . Dumper $last_run;
+#warn "t-r : " . Dumper $to_run;
+
+  # which test should we run?
+  # XXX eventually will work out based on name but for now
+  unless( keys %$to_run ) {
+    # this means that no test files were updated in this run
+    # the code may already have a related test file
+    if( keys %{$mapper->{'code'}} ) {
+      for my $t ( keys %{$mapper->{'code'}} ) {
+        next unless defined $class_to_test->{$t};
+        print STDERR "class-to-test: " . $t . " --->  " . ( join ' , ', keys %{$class_to_test->{$t}} ) . "\n";
+        map{ $to_run->{$_} =1 } keys %{$class_to_test->{$t}}
+      }
+    }
+
+#warn "t-r : " . Dumper $to_run;
+    # if we still do not have tests to run
+    if( ! keys %$to_run && keys %$last_run ) {
+      print STDERR "running test for last run\n";
+      for ( keys %$last_run ) {
+        print STDERR "last-run :". $_ . "\n";
+        $to_run->{$_} = 1;
+      }
+      # populate hashes     # populate hashes     # populate hashes
+      $to_run = $class->_map_tests_to_classes(
+        tests   => $to_run,
+        classes => $mapper->{'code'}
+      );
+    }
+
+    unless( keys %$to_run ) {
+      # we tried
+      print STDERR "no test found to match files changed :(\n";
+      $to_run = {};
+    }
+  }
+
+#warn "t-r leaving: " . Dumper $to_run;
+  return $to_run;
+}
+
+sub get_perl {
+  my( $class, %args )  = @_;
+  my( $changed )  = @args{qw/ changed /};
+  my $perl        = 'perl ';
+  my $perld       = 'DYNAMITE_KEEP_TEST_DB=1 DYNAMITE_DONT_MIGRATE_TEST_DB=1 perl -d ';
+  my $injector    = 'INJECT_IN_UNITTEST=1 ';
+  return $perl unless keys %$changed;
+#warn Dumper $changed;
+  for my $file ( keys %$changed ) {
+    my $debug_flagged   = system( 'ack-grep $DB::single ' . $file ); # stupid unix reverse logic
+    my $inject_flagged  = system( 'ack-grep $DB::inject ' . $file ); 
+#warn $file . " $debug_flagged\n";
+    if( $debug_flagged == 0 ) {
+      print STDERR "$file flagged for debug\n";
+      $flagged_for_debug->{$file} = 1;
+    }
+    elsif( defined $flagged_for_debug->{$file} ) {
+      print STDERR "$file de-flagged for debug\n";
+      delete $flagged_for_debug->{$file};
+    }
+
+    if( $inject_flagged == 0 ) {
+      print STDERR "$file contains injector flag.. \n";
+      print STDERR "INJECTOR ACTIVE\n";
+      $flagged_injection->{$file} = 1;
+      $perl   = $injector . $perl;
+      $perld  = $injector . $perld;
+    }
+    elsif( defined $flagged_injection->{$file} ) {
+      print STDERR "$file injection de-flagged \n";
+      delete $flagged_injection->{$file};
+    }
+  }
+
+  if( keys %$flagged_for_debug ) {
+    print STDERR "running test in debug mode\n";
+    print STDERR "Files currently marked for debug\n\n";
+    map{ print STDERR "$_\n" } keys %$flagged_for_debug;
+    print STDERR "\n";
+    return $perld;
+  }
+  else {
+    return $perl;
+  }
+}
+
+sub _map_tests_to_classes {
+  my( $class, %args )  = @_;
+  my( $tests, $classes ) = @args{qw/ tests classes /};
+
+  my $to_run  = {};
+  # map to global mappings
+  for my $file ( keys %$tests ) {
+    $to_run->{$file}  = 1;
+    print STDERR "test-file : ". $file . "\n";
+    next unless( keys %$classes );
+    map{ $test_to_class->{$file}{$_} = 1 } keys %$classes;
+  }
+    
+  for my $file ( keys %$classes ) {
+    next unless( keys %$tests );
+    map{ $class_to_test->{$file}{$_} = 1 } keys %$tests;
+  }
+  return $to_run;
+}
+
+sub _get_config {
+  my $class     = shift;
+  my $default_paths = [qw( t/ lib/ )];
+  my $filter;
+  my $config    = {
+    filter      => qr/\.(?:pm|t)$/,
+    dirs        => [qw( t/ lib/ )],
+  };
+
+
+  GetOptions( 
+   "help|?"             => \( $config->{help}               ),
+   "dirs:s"             => \( $config->{dirs}               ),
+   "filter:s"           => \( $filter                       ),
+   "always_run:s"           => \( $config->{always_run}     ),
+   "run_everything+"    => \( $config->{run_everything}     ),
+  ) or $class->usage();
+
+  $config->{dirs} = [  $config->{dirs} ]
+    unless( ref  $config->{dirs} eq 'ARRAY' );
+
+  $config->{filter} = qr/\.(?:$filter)$/
+    if $filter;
+
+  $class->usage() if defined $config->{help};
+  return $config;
+}
+
+sub usage { shift; pod2usage(@_); exit(1) }
+
+package main;
+Test::Continuously->run;
+
+=head1 NAME
+
+continuous_tester.pl
+
+=head1 SYNOPSIS
+
+  ./populate_refdata.pl
+    --filter "pm|t|pl" --dirs "./"
+
+perldoc continuous_tester for full list of options
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--filter>
+
+specify a single target host. The host must exist in the conf file ( see B<--list> for host descovery )
+
+populate_refdata.pl --host huxley
+
+will update all reference data ( excluding optional ) on the database associated with the host 'huxley'
+
+
+=item B<--dirs>
+
+specify a target environment. An environment is made up of 1 or more hosts. Should be used when you want to apply the change to a group of databases. See B<--list> for environment host discovery.
+
+=item B<--run_everything>
+
+run every file that is changed even if it does not match our test file signiture
+
+
+=back
+
+=head1 DESCRIPTION
+
+program watches given directories and runs any files that are changed which match its filters
+
+=cut
+
+
+1;
