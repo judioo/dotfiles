@@ -164,8 +164,8 @@ sub get_perl {
   return $perl unless keys %$changed;
 #warn Dumper $changed;
   for my $file ( keys %$changed ) {
-    my $debug_flagged   = system( 'ack-grep $DB::single ' . $file ); # stupid unix reverse logic
-    my $inject_flagged  = system( 'ack-grep $DB::inject ' . $file ); 
+    my $debug_flagged   = system( 'ack $DB::single ' . $file ); # stupid unix reverse logic
+    my $inject_flagged  = system( 'ack $DB::inject ' . $file ); 
 #warn $file . " $debug_flagged\n";
     if( $debug_flagged == 0 ) {
       print STDERR "$file flagged for debug\n";
@@ -225,6 +225,7 @@ sub _get_config {
   my $class     = shift;
   my $default_paths = [qw( t/ lib/ )];
   my $filter;
+  my @paths;
   my $config    = {
     filter      => qr/\.(?:pm|t)$/,
     dirs        => [qw( t/ lib/ )],
@@ -233,14 +234,13 @@ sub _get_config {
 
   GetOptions( 
    "help|?"             => \( $config->{help}               ),
-   "dirs:s"             => \( $config->{dirs}               ),
+   "dirs:s"             => \@paths                           ,
    "filter:s"           => \( $filter                       ),
    "always_run:s"           => \( $config->{always_run}     ),
    "run_everything+"    => \( $config->{run_everything}     ),
   ) or $class->usage();
 
-  $config->{dirs} = [  $config->{dirs} ]
-    unless( ref  $config->{dirs} eq 'ARRAY' );
+  $config->{dirs} = \@paths if scalar @paths;
 
   $config->{filter} = qr/\.(?:$filter)$/
     if $filter;
@@ -256,12 +256,12 @@ Test::Continuously->run;
 
 =head1 NAME
 
-continuous_tester.pl
+continuous_tester
 
 =head1 SYNOPSIS
 
-  ./populate_refdata.pl
-    --filter "pm|t|pl" --dirs "./"
+  ./continuous_tester
+    --filter "pm|t|pl" --dirs ./ --dirs /another/place
 
 perldoc continuous_tester for full list of options
 
